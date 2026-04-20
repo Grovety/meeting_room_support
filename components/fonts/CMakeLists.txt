@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "ui_font_FontZHHH16.c"
+        "ui_font_FontZZh16.c"
+        "ui_font_FontZZh20.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        lvgl__lvgl
+)

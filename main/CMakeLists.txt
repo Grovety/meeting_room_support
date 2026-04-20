@@ -1,0 +1,21 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "ui_aux_panel.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        lvgl__lvgl
+        esp_timer
+        esp_lcd
+        driver
+        esp_event
+        esp_netif
+        esp_wifi
+        esp_http_client
+        esp_http_server
+        nvs_flash
+        json
+        lwip
+        fonts
+)
