@@ -4,6 +4,7 @@
 #include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "driver/spi_master.h"
+#include "driver/uart.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_io.h"
@@ -21,6 +22,7 @@
 #include "lvgl.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "cJSON.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -34,6 +36,9 @@
 #include <time.h>
 
 static const char *TAG = "mycube3_5";
+
+#define GUI_UART_PORT   UART_NUM_0
+#define GUI_RX_BUF_SIZE 1024
 
 #define AUX_PANEL_HOR_RES 480
 #define AUX_PANEL_VER_RES 320
@@ -209,6 +214,9 @@ static httpd_handle_t s_setup_httpd = NULL;
 static esp_netif_t *s_sta_netif = NULL;
 static esp_netif_t *s_ap_netif = NULL;
 static bool s_wifi_stack_ready = false;
+static volatile bool s_wifi_runtime_apply_in_progress = false;
+static TaskHandle_t s_wifi_runtime_apply_task = NULL;
+static TickType_t s_wifi_runtime_apply_delay_ticks = 0;
 static char s_sta_ip_text[16] = "0.0.0.0";
 static char s_setup_ap_ssid[33] = {0};
 static char s_cfg_wifi_ssid[AUX_PANEL_WIFI_SSID_LEN] = {0};
@@ -265,6 +273,8 @@ static esp_err_t ensure_setup_http_server(void);
 static esp_err_t configure_setup_ap(void);
 static esp_err_t update_wifi_mode_for_connectivity(bool connected);
 static esp_err_t force_setup_ap_mode(void);
+static esp_err_t schedule_apply_saved_wifi_runtime(void);
+static esp_err_t schedule_apply_saved_wifi_runtime_delayed(TickType_t delay_ticks);
 static void queue_settings_ui_texts(const char *wifi_text, const char *setup_text, const char *setup_url);
 static void reset_main_ui_state(void);
 
@@ -512,17 +522,19 @@ static esp_err_t apply_saved_wifi_runtime(void)
     wifi_config_t wifi_sta_config = {0};
     esp_err_t err = ESP_OK;
 
+    s_wifi_runtime_apply_in_progress = true;
+
     if (s_cfg_wifi_ssid[0] == '\0') {
         (void)esp_wifi_disconnect();
         s_wifi_connected = false;
         copy_string_field("0.0.0.0", s_sta_ip_text, sizeof(s_sta_ip_text));
         err = force_setup_ap_mode();
         if (err != ESP_OK) {
-            return err;
+            goto done;
         }
         update_settings_ui_texts();
         (void)ensure_setup_http_server();
-        return ESP_OK;
+        goto done;
     }
 
     copy_string_field(s_cfg_wifi_ssid, (char *)wifi_sta_config.sta.ssid, sizeof(wifi_sta_config.sta.ssid));
@@ -531,28 +543,165 @@ static esp_err_t apply_saved_wifi_runtime(void)
     wifi_sta_config.sta.pmf_cfg.capable = true;
     wifi_sta_config.sta.pmf_cfg.required = false;
 
+    (void)esp_wifi_disconnect();
+    s_wifi_connected = false;
+    copy_string_field("0.0.0.0", s_sta_ip_text, sizeof(s_sta_ip_text));
+    update_settings_ui_texts();
+    vTaskDelay(pdMS_TO_TICKS(250));
+
     err = update_wifi_mode_for_connectivity(false);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to switch Wi-Fi mode before STA config: %s", esp_err_to_name(err));
-        return err;
+        goto done;
     }
 
-    err = esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config);
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    err = ESP_ERR_WIFI_STATE;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        err = esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config);
+        if (err == ESP_OK) {
+            break;
+        }
+        if (err != ESP_ERR_WIFI_STATE) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to apply STA config for ssid '%s': %s",
                  s_cfg_wifi_ssid,
                  esp_err_to_name(err));
-        return err;
+        goto done;
     }
+
     (void)esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(120));
     err = esp_wifi_connect();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to start STA connect for ssid '%s': %s",
                  s_cfg_wifi_ssid,
                  esp_err_to_name(err));
-        return err;
+        goto done;
     }
+
+done:
+    s_wifi_runtime_apply_in_progress = false;
+    return err;
+}
+
+static void wifi_runtime_apply_task(void *arg)
+{
+    (void)arg;
+    TickType_t delay_ticks = s_wifi_runtime_apply_delay_ticks;
+
+    s_wifi_runtime_apply_delay_ticks = 0;
+    if (delay_ticks > 0) {
+        vTaskDelay(delay_ticks);
+    }
+
+    esp_err_t err = apply_saved_wifi_runtime();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Deferred Wi-Fi apply failed: %s", esp_err_to_name(err));
+    }
+
+    s_wifi_runtime_apply_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static esp_err_t schedule_apply_saved_wifi_runtime(void)
+{
+    return schedule_apply_saved_wifi_runtime_delayed(0);
+}
+
+static esp_err_t schedule_apply_saved_wifi_runtime_delayed(TickType_t delay_ticks)
+{
+    if (s_wifi_runtime_apply_task != NULL) {
+        ESP_LOGI(TAG, "Wi-Fi apply already in progress; keeping the latest saved config");
+        return ESP_OK;
+    }
+
+    s_wifi_runtime_apply_delay_ticks = delay_ticks;
+    BaseType_t rc = xTaskCreate(wifi_runtime_apply_task, "wifi_apply", 4096, NULL, 5, &s_wifi_runtime_apply_task);
+    if (rc != pdPASS) {
+        s_wifi_runtime_apply_delay_ticks = 0;
+        s_wifi_runtime_apply_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
     return ESP_OK;
+}
+
+static void gui_uart_task(void *arg)
+{
+    (void)arg;
+    uint8_t *data = malloc(GUI_RX_BUF_SIZE);
+    if (!data) {
+        ESP_LOGE(TAG, "gui_uart_task: malloc failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "gui_uart_task started, reading from UART port %d", (int)GUI_UART_PORT);
+
+    while (1) {
+        int len = uart_read_bytes(GUI_UART_PORT, data, GUI_RX_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        if (len <= 0) {
+            continue;
+        }
+
+        data[len] = '\0';
+        char *payload = (char *)data;
+        while (*payload == '\r' || *payload == '\n') {
+            ++payload;
+        }
+
+        size_t payload_len = strlen(payload);
+        while (payload_len > 0 && (payload[payload_len - 1] == '\r' || payload[payload_len - 1] == '\n')) {
+            payload[--payload_len] = '\0';
+        }
+
+        if (payload_len == 0) {
+            continue;
+        }
+
+        ESP_LOGI(TAG, "UART0 RX (%d bytes)", len);
+
+        cJSON *root = cJSON_Parse(payload);
+        if (!root) {
+            ESP_LOGW(TAG, "UART0: failed to parse JSON payload");
+            continue;
+        }
+
+        cJSON *ssid = cJSON_GetObjectItemCaseSensitive(root, "wifi_ssid");
+        cJSON *pass = cJSON_GetObjectItemCaseSensitive(root, "wifi_pass");
+
+        if (!cJSON_IsString(ssid) || ssid->valuestring[0] == '\0') {
+            ESP_LOGW(TAG, "UART0: wifi_ssid is missing in JSON payload");
+            cJSON_Delete(root);
+            continue;
+        }
+
+        const char *pass_value = cJSON_IsString(pass) ? pass->valuestring : "";
+        ESP_LOGI(TAG, "UART0: got Wi-Fi credentials for ssid '%s'", ssid->valuestring);
+
+        esp_err_t err = save_runtime_config(ssid->valuestring, pass_value, s_cfg_panel_name);
+        if (err == ESP_OK) {
+            err = schedule_apply_saved_wifi_runtime();
+        }
+
+        if (err == ESP_OK) {
+            const char *ok = "WIFI:OK\n";
+            uart_write_bytes(GUI_UART_PORT, ok, strlen(ok));
+        } else {
+            ESP_LOGE(TAG, "UART0: failed to apply Wi-Fi config: %s", esp_err_to_name(err));
+            const char *fail = "WIFI:ERR\n";
+            uart_write_bytes(GUI_UART_PORT, fail, strlen(fail));
+        }
+
+        cJSON_Delete(root);
+    }
 }
 
 static esp_err_t forget_saved_wifi_runtime(void)
@@ -871,17 +1020,29 @@ static esp_err_t setup_save_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save settings");
     }
 
-    esp_err_t apply_err = apply_saved_wifi_runtime();
+    esp_err_t apply_err = schedule_apply_saved_wifi_runtime_delayed(pdMS_TO_TICKS(1500));
     if (apply_err != ESP_OK) {
-        ESP_LOGW(TAG, "apply_saved_wifi_runtime failed after setup save: %s", esp_err_to_name(apply_err));
+        ESP_LOGW(TAG, "schedule_apply_saved_wifi_runtime failed after setup save: %s", esp_err_to_name(apply_err));
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to apply Wi-Fi settings");
     }
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req,
-                       "<!doctype html><html><head><meta charset='utf-8'>"
-                       "<meta name='viewport' content='width=device-width,initial-scale=1'></head>"
-                       "<body><h3>Changes are being applied...</h3></body></html>");
+                       "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+                       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                       "<title>Wi-Fi Settings Saved</title><style>"
+                       ":root{color-scheme:dark;--bg:#0f1218;--panel:#171c25;--line:#273142;--accent:#3fb983;--text:#fff;--muted:#98a2b3;}"
+                       "*{box-sizing:border-box}"
+                       "body{margin:0;min-height:100vh;padding:24px;font:16px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:var(--text);background:radial-gradient(circle at top,#1a2330,#0b0d12 68%);display:flex;align-items:center;justify-content:center}"
+                       ".card{width:min(560px,100%);background:rgba(23,28,37,.96);border:1px solid var(--line);border-radius:24px;padding:28px;box-shadow:0 24px 60px rgba(0,0,0,.35)}"
+                       "h1{margin:0 0 10px;font-size:30px}p{margin:0 0 12px}.muted{color:var(--muted)}"
+                       ".ok{display:inline-block;margin-bottom:14px;padding:6px 10px;border-radius:999px;background:rgba(63,185,131,.16);color:#d8ffe8;font-weight:700}"
+                       "</style></head><body><div class='card'>"
+                       "<div class='ok'>Settings saved</div>"
+                       "<h1>Wi-Fi settings saved.</h1>"
+                       "<p>The device will reconnect using the new network details in a moment.</p>"
+                       "<p class='muted'>If this page disconnects, reopen the setup page using the device IP on the new network.</p>"
+                       "</div></body></html>");
     return ESP_OK;
 }
 
@@ -1949,6 +2110,7 @@ static void reset_main_ui_state(void)
         .clock_text = "--:--",
         .date_text = "--",
         .room_name = "",
+        .link_online = false,
         .occupied = false,
         .remaining_sec = 0,
     };
@@ -2073,8 +2235,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         (void)update_wifi_mode_for_connectivity(false);
         update_settings_ui_texts();
         if (s_cfg_wifi_ssid[0] != '\0') {
-            ESP_LOGW(TAG, "Wi-Fi disconnected, retrying");
-            esp_wifi_connect();
+            if (s_wifi_runtime_apply_in_progress) {
+                ESP_LOGI(TAG, "Wi-Fi disconnected while runtime apply is in progress; auto-retry suppressed");
+            } else {
+                ESP_LOGW(TAG, "Wi-Fi disconnected, retrying");
+                esp_wifi_connect();
+            }
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ip_event = (ip_event_got_ip_t *)event_data;
@@ -2350,6 +2516,7 @@ static void decode_udp_packet_to_state(const aux_udp_packet_v1_t *packet,
                       state_out->clock_text,
                       sizeof(state_out->clock_text));
     copy_string_field("--", state_out->date_text, sizeof(state_out->date_text));
+    state_out->link_online = true;
 
     if (packet->sent_epoch_sec > 0) {
         offset_sec = infer_server_timezone_offset_sec((time_t)packet->sent_epoch_sec, state_out->clock_text);
@@ -2545,6 +2712,7 @@ static void aux_link_task(void *arg)
     int64_t last_ui_publish_us = 0;
     char target_main_id[AUX_UDP_MAIN_ID_LEN] = {0};
     char target_room_name[AUX_UDP_ROOM_NAME_LEN] = {0};
+    bool link_online = false;
 
     (void)arg;
 
@@ -2604,6 +2772,10 @@ static void aux_link_task(void *arg)
             clear_paired_main_addr();
             clear_discovery_cache();
             s_last_state_rx_us = 0;
+            if (link_online) {
+                reset_main_ui_state();
+                link_online = false;
+            }
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
@@ -2654,6 +2826,18 @@ static void aux_link_task(void *arg)
         }
 
         (void)fetch_state_from_master();
+        if (s_last_state_rx_us != 0) {
+            link_online = true;
+        }
+
+        if (link_online &&
+            (now_us - s_last_state_rx_us) >= (AUX_PANEL_STATE_STALE_MS * 1000LL)) {
+            ESP_LOGW(TAG, "Main panel state timed out; marking link offline");
+            s_have_last_udp_seq = false;
+            s_last_state_rx_us = 0;
+            reset_main_ui_state();
+            link_online = false;
+        }
         log_discovered_mains_if_needed();
         if (last_ui_publish_us == 0 || (now_us - last_ui_publish_us) >= 1000 * 1000LL) {
             publish_pair_ui_snapshot();
@@ -2795,6 +2979,7 @@ void app_main(void)
     aux_panel_room_state_t boot_state = {
         .clock_text = "--:--",
         .room_name = "",
+        .link_online = false,
         .occupied = false,
         .remaining_sec = 0,
     };
@@ -2828,6 +3013,26 @@ void app_main(void)
     aux_panel_ui_set_wifi_forget_callback(ui_wifi_forget_callback);
     update_settings_ui_texts();
     publish_pair_ui_snapshot();
+
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    esp_err_t uart_err = uart_param_config(GUI_UART_PORT, &uart_config);
+    if (uart_err != ESP_OK) {
+        ESP_LOGE(TAG, "uart_param_config failed: %s", esp_err_to_name(uart_err));
+    }
+
+    uart_err = uart_driver_install(GUI_UART_PORT, GUI_RX_BUF_SIZE * 2, 0, 0, NULL, 0);
+    if (uart_err != ESP_OK && uart_err != ESP_FAIL) {
+        ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(uart_err));
+    } else {
+        xTaskCreate(gui_uart_task, "gui_uart_task", 4096, NULL, 4, NULL);
+    }
 
     if (s_touch_ic != AUX_TOUCH_NONE) {
         xTaskCreate(touch_poll_task, "touch_poll", 4096, NULL, 5, NULL);

@@ -14,6 +14,7 @@ typedef struct {
     char clock_text[16];
     char date_text[48];
     char room_name[48];
+    bool link_online;
     bool occupied;
     int remaining_sec;
 } aux_panel_room_state_t;

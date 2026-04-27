@@ -94,6 +94,7 @@ static bool s_has_last_state = false;
 static const aux_panel_room_state_t k_default_state = {
     .clock_text = "--:--",
     .room_name = "Meeting Room",
+    .link_online = false,
     .occupied = false,
     .remaining_sec = 0,
 };
@@ -110,6 +111,7 @@ static const char *tr_busy(void) { return s_ui_lang == AUX_PANEL_UI_LANG_ZH ? "�
 static const char *tr_busy_now(void) { return s_ui_lang == AUX_PANEL_UI_LANG_ZH ? "当前忙碌" : "Busy now"; }
 static const char *tr_no_active_meeting(void) { return s_ui_lang == AUX_PANEL_UI_LANG_ZH ? "当前没有会议" : "No active meeting"; }
 static const char *tr_meeting_in_progress(void) { return s_ui_lang == AUX_PANEL_UI_LANG_ZH ? "会议进行中" : "Meeting in progress"; }
+static const char *tr_link_lost(void) { return s_ui_lang == AUX_PANEL_UI_LANG_ZH ? "主面板离线" : "Main panel offline"; }
 static const char *tr_no_main_panels(void) { return s_ui_lang == AUX_PANEL_UI_LANG_ZH ? "暂未发现主面板" : "No main panels found yet"; }
 static const char *tr_unknown_room(void) { return s_ui_lang == AUX_PANEL_UI_LANG_ZH ? "未知会议室" : "Unknown room"; }
 static const char *tr_unknown(void) { return s_ui_lang == AUX_PANEL_UI_LANG_ZH ? "未知" : "unknown"; }
@@ -206,10 +208,18 @@ static void style_surface_card(lv_obj_t *obj, uint32_t bg, uint32_t border, lv_c
     lv_obj_set_style_pad_all(obj, 0, 0);
 }
 
-static void style_status_pill(bool occupied)
+static void style_status_pill(bool link_online, bool occupied)
 {
-    const uint32_t bg = occupied ? AUX_COLOR_DANGER : AUX_COLOR_ACCENT;
-    const uint32_t border = occupied ? AUX_COLOR_DANGER_LIGHT : AUX_COLOR_ACCENT_LIGHT;
+    uint32_t bg = AUX_COLOR_ACCENT;
+    uint32_t border = AUX_COLOR_ACCENT_LIGHT;
+
+    if (!link_online) {
+        bg = AUX_COLOR_PANEL_ALT;
+        border = AUX_COLOR_BORDER;
+    } else if (occupied) {
+        bg = AUX_COLOR_DANGER;
+        border = AUX_COLOR_DANGER_LIGHT;
+    }
 
     if (!s_status_pill) {
         return;
@@ -219,13 +229,19 @@ static void style_status_pill(bool occupied)
     lv_obj_set_style_shadow_width(s_status_pill, 0, 0);
 }
 
-static void format_remaining_text(int remaining_sec, bool occupied, char *out, size_t out_size)
+static void format_remaining_text(bool link_online, int remaining_sec, bool occupied, char *out, size_t out_size)
 {
     int total_minutes = 0;
     int hours = 0;
     int minutes = 0;
 
     if (!out || out_size == 0) {
+        return;
+    }
+
+    if (!link_online) {
+        snprintf(out, out_size, "%s", tr_link_lost());
+        out[out_size - 1] = '\0';
         return;
     }
 
@@ -654,14 +670,17 @@ static void create_status_card(lv_obj_t *screen, const aux_panel_room_state_t *s
     lv_obj_set_pos(s_status_section_label, 20, 10);
 
     s_status_pill = create_plain_object(card);
-    style_status_pill(state->occupied);
+    style_status_pill(state->link_online, state->occupied);
     lv_obj_set_size(s_status_pill, 128, 42);
     lv_obj_set_pos(s_status_pill, 20, 40);
 
-    s_status_word_label = create_label(s_status_pill, state->occupied ? tr_busy() : tr_free(), font24(), AUX_COLOR_TEXT);
+    s_status_word_label = create_label(s_status_pill,
+                                       state->link_online ? (state->occupied ? tr_busy() : tr_free()) : "",
+                                       font24(),
+                                       AUX_COLOR_TEXT);
     lv_obj_center(s_status_word_label);
 
-    format_remaining_text(state->remaining_sec, state->occupied, remaining_text, sizeof(remaining_text));
+    format_remaining_text(state->link_online, state->remaining_sec, state->occupied, remaining_text, sizeof(remaining_text));
     s_remaining_label = create_label(card, remaining_text, font28(), AUX_COLOR_TEXT);
     lv_label_set_long_mode(s_remaining_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_remaining_label, 250);
@@ -676,7 +695,7 @@ static void create_status_card(lv_obj_t *screen, const aux_panel_room_state_t *s
     lv_obj_set_width(s_status_note_label, 250);
     lv_obj_set_height(s_status_note_label, 34);
     lv_obj_set_pos(s_status_note_label, 164, 72);
-    if (!state->occupied) {
+    if (!state->link_online || !state->occupied) {
         lv_obj_add_flag(s_status_note_label, LV_OBJ_FLAG_HIDDEN);
     }
 }
@@ -704,20 +723,21 @@ void aux_panel_ui_apply_state(const aux_panel_room_state_t *state)
     }
 
     if (s_status_pill) {
-        style_status_pill(state->occupied);
+        style_status_pill(state->link_online, state->occupied);
     }
 
     if (s_status_word_label) {
-        lv_label_set_text(s_status_word_label, state->occupied ? tr_busy() : tr_free());
+        lv_label_set_text(s_status_word_label,
+                          state->link_online ? (state->occupied ? tr_busy() : tr_free()) : "");
     }
 
-    format_remaining_text(state->remaining_sec, state->occupied, remaining_text, sizeof(remaining_text));
+    format_remaining_text(state->link_online, state->remaining_sec, state->occupied, remaining_text, sizeof(remaining_text));
     if (s_remaining_label) {
         lv_label_set_text(s_remaining_label, remaining_text);
     }
 
     if (s_status_note_label) {
-        if (state->occupied) {
+        if (state->link_online && state->occupied) {
             lv_obj_clear_flag(s_status_note_label, LV_OBJ_FLAG_HIDDEN);
             lv_label_set_text(s_status_note_label, tr_meeting_in_progress());
             lv_obj_set_style_text_color(s_status_note_label, color_hex(AUX_COLOR_TEXT_MUTED), 0);
